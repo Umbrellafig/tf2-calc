@@ -1,4 +1,6 @@
 {
-  "keyPrice": 3300,
-  "metalPerKey": 56
+  "keyPriceKRW": 3300,
+  "metalPerKey": 56,
+  "todTicketMetal": 27,
+  "lastUpdated": ""
 }
