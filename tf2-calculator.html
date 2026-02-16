@@ -137,11 +137,11 @@
     <div class="settings-row">
       <div>
         <label>🔑 1키 가격 (원)</label>
-        <input type="number" id="keyPrice" value="3300" oninput="onSettingChange()">
+        <input type="number" id="keyPrice" value="" oninput="onSettingChange()">
       </div>
       <div>
         <label>⚙️ 1키당 정제금속</label>
-        <input type="number" id="metalPerKey" value="56" oninput="onSettingChange()">
+        <input type="number" id="metalPerKey" value="" oninput="onSettingChange()">
       </div>
     </div>
   </div>
@@ -267,7 +267,15 @@ function toggleSettings(btn) {
   btn.classList.toggle('active', show);
 }
 
-updateBadges();
+// config.json에서 환율 로드
+fetch('config.json')
+  .then(r => r.json())
+  .then(c => {
+    $('keyPrice').value = c.keyPrice;
+    $('metalPerKey').value = c.metalPerKey;
+    updateBadges();
+  })
+  .catch(() => updateBadges());
 </script>
 </body>
 </html>
