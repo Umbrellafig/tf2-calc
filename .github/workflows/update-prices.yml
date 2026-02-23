@@ -8,38 +8,40 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
 
     steps:
-      - uses: actions/checkout@v4
-
       - name: Fetch prices from backpack.tf
         env:
           BPTF_API_KEY: ${{ secrets.BPTF_API_KEY }}
+          GIST_ID: 7a542432dab00eb708b372a19d3e5b90
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # 1) IGetCurrencies → 키 가격(정제금속)
+          # 1) 현재 Gist에서 기존 config 읽기
+          OLD_CONFIG=$(curl -sf \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "https://api.github.com/gists/${GIST_ID}" | jq -r '.files["config.json"].content')
+          OLD_KRW=$(echo "$OLD_CONFIG" | jq -r '.keyPriceKRW')
+
+          # 2) IGetCurrencies → 키 가격(정제금속)
           CURRENCIES=$(curl -sf "https://backpack.tf/api/IGetCurrencies/v1?key=${BPTF_API_KEY}")
           METAL_PER_KEY=$(echo "$CURRENCIES" | jq -r '.response.currencies.keys.price.value // empty')
 
-          # 2) IGetPrices → ToD Ticket 가격(정제금속)
+          # 3) IGetPrices → ToD Ticket 가격(정제금속)
           PRICES=$(curl -sf "https://backpack.tf/api/IGetPrices/v4?key=${BPTF_API_KEY}")
           TOD_METAL=$(echo "$PRICES" | jq -r '.response.items["Tour of Duty Ticket"].prices["6"]["0"]["Tradable"]["Non-Craftable"][0].value // empty')
 
           # 값이 있을 때만 업데이트
           if [ -n "$METAL_PER_KEY" ]; then
-            # 기존 config 읽기
-            KRW=$(jq -r '.keyPriceKRW' config.json)
             NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
             # ToD 값이 없으면 기존 값 유지
             if [ -z "$TOD_METAL" ]; then
-              TOD_METAL=$(jq -r '.todTicketMetal' config.json)
+              TOD_METAL=$(echo "$OLD_CONFIG" | jq -r '.todTicketMetal')
             fi
 
-            # config.json 업데이트
-            jq -n \
-              --argjson krw "$KRW" \
+            # 새 config 생성
+            NEW_CONFIG=$(jq -n \
+              --argjson krw "$OLD_KRW" \
               --argjson mpk "$METAL_PER_KEY" \
               --argjson tod "$TOD_METAL" \
               --arg ts "$NOW" \
@@ -48,18 +50,18 @@ jobs:
                 metalPerKey: $mpk,
                 todTicketMetal: $tod,
                 lastUpdated: $ts
-              }' > config.json
+              }')
+
+            # Gist 업데이트 (GitHub API)
+            PAYLOAD=$(jq -n --arg content "$NEW_CONFIG" '{files: {"config.json": {content: $content}}}')
+            curl -sf -X PATCH \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD" \
+              "https://api.github.com/gists/${GIST_ID}" > /dev/null
 
             echo "Updated: metalPerKey=$METAL_PER_KEY, todTicket=$TOD_METAL"
           else
             echo "API fetch failed, skipping update"
             exit 0
           fi
-
-      - name: Commit if changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add config.json
-          git diff --cached --quiet || git commit -m "chore: update TF2 prices (auto)"
-          git push
