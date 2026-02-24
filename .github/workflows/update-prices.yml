@@ -10,58 +10,108 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Fetch prices from backpack.tf
+      - name: Fetch prices and update Gist
         env:
           BPTF_API_KEY: ${{ secrets.BPTF_API_KEY }}
           GIST_ID: 7a542432dab00eb708b372a19d3e5b90
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
-          # 1) 현재 Gist에서 기존 config 읽기
-          OLD_CONFIG=$(curl -sf \
+          set +e  # 개별 에러를 직접 처리
+
+          # 1) Gist에서 기존 config 읽기
+          echo ">>> Step 1: Fetching Gist..."
+          GIST_RAW=$(curl -sS -w "\nHTTP_CODE:%{http_code}" \
             -H "Authorization: token ${GH_TOKEN}" \
-            "https://api.github.com/gists/${GIST_ID}" | jq -r '.files["config.json"].content')
+            "https://api.github.com/gists/${GIST_ID}")
+          GIST_HTTP=$(echo "$GIST_RAW" | tail -1 | sed 's/HTTP_CODE://')
+          GIST_BODY=$(echo "$GIST_RAW" | sed '$d')
+          echo "Gist HTTP status: $GIST_HTTP"
+
+          if [ "$GIST_HTTP" != "200" ]; then
+            echo "ERROR: Gist fetch failed (HTTP $GIST_HTTP)"
+            echo "$GIST_BODY" | head -5
+            exit 1
+          fi
+
+          OLD_CONFIG=$(echo "$GIST_BODY" | jq -r '.files["config.json"].content')
           OLD_KRW=$(echo "$OLD_CONFIG" | jq -r '.keyPriceKRW')
+          echo "Current KRW: $OLD_KRW"
 
           # 2) IGetCurrencies → 키 가격(정제금속)
-          CURRENCIES=$(curl -sf "https://backpack.tf/api/IGetCurrencies/v1?key=${BPTF_API_KEY}")
-          METAL_PER_KEY=$(echo "$CURRENCIES" | jq -r '.response.currencies.keys.price.value // empty')
+          echo ">>> Step 2: Fetching key price..."
+          CURR_RAW=$(curl -sS -w "\nHTTP_CODE:%{http_code}" \
+            "https://backpack.tf/api/IGetCurrencies/v1?key=${BPTF_API_KEY}")
+          CURR_HTTP=$(echo "$CURR_RAW" | tail -1 | sed 's/HTTP_CODE://')
+          CURR_BODY=$(echo "$CURR_RAW" | sed '$d')
+          echo "Currencies HTTP status: $CURR_HTTP"
+
+          if [ "$CURR_HTTP" != "200" ]; then
+            echo "ERROR: IGetCurrencies failed (HTTP $CURR_HTTP)"
+            echo "$CURR_BODY" | head -5
+            exit 1
+          fi
+
+          METAL_PER_KEY=$(echo "$CURR_BODY" | jq -r '.response.currencies.keys.price.value // empty')
+          echo "Metal per key: $METAL_PER_KEY"
+
+          if [ -z "$METAL_PER_KEY" ]; then
+            echo "ERROR: Could not parse metalPerKey from response"
+            echo "$CURR_BODY" | jq '.response.currencies.keys' 2>/dev/null || echo "$CURR_BODY" | head -10
+            exit 1
+          fi
 
           # 3) IGetPrices → ToD Ticket 가격(정제금속)
-          PRICES=$(curl -sf "https://backpack.tf/api/IGetPrices/v4?key=${BPTF_API_KEY}")
-          TOD_METAL=$(echo "$PRICES" | jq -r '.response.items["Tour of Duty Ticket"].prices["6"]["0"]["Tradable"]["Non-Craftable"][0].value // empty')
+          echo ">>> Step 3: Fetching ToD Ticket price..."
+          PRICES_RAW=$(curl -sS -w "\nHTTP_CODE:%{http_code}" \
+            "https://backpack.tf/api/IGetPrices/v4?key=${BPTF_API_KEY}")
+          PRICES_HTTP=$(echo "$PRICES_RAW" | tail -1 | sed 's/HTTP_CODE://')
+          PRICES_BODY=$(echo "$PRICES_RAW" | sed '$d')
+          echo "Prices HTTP status: $PRICES_HTTP"
 
-          # 값이 있을 때만 업데이트
-          if [ -n "$METAL_PER_KEY" ]; then
-            NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-
-            # ToD 값이 없으면 기존 값 유지
-            if [ -z "$TOD_METAL" ]; then
-              TOD_METAL=$(echo "$OLD_CONFIG" | jq -r '.todTicketMetal')
-            fi
-
-            # 새 config 생성
-            NEW_CONFIG=$(jq -n \
-              --argjson krw "$OLD_KRW" \
-              --argjson mpk "$METAL_PER_KEY" \
-              --argjson tod "$TOD_METAL" \
-              --arg ts "$NOW" \
-              '{
-                keyPriceKRW: $krw,
-                metalPerKey: $mpk,
-                todTicketMetal: $tod,
-                lastUpdated: $ts
-              }')
-
-            # Gist 업데이트 (GitHub API)
-            PAYLOAD=$(jq -n --arg content "$NEW_CONFIG" '{files: {"config.json": {content: $content}}}')
-            curl -sf -X PATCH \
-              -H "Authorization: token ${GH_TOKEN}" \
-              -H "Content-Type: application/json" \
-              -d "$PAYLOAD" \
-              "https://api.github.com/gists/${GIST_ID}" > /dev/null
-
-            echo "Updated: metalPerKey=$METAL_PER_KEY, todTicket=$TOD_METAL"
+          TOD_METAL=""
+          if [ "$PRICES_HTTP" = "200" ]; then
+            TOD_METAL=$(echo "$PRICES_BODY" | jq -r '.response.items["Tour of Duty Ticket"].prices["6"]["0"]["Tradable"]["Non-Craftable"][0].value // empty')
+            echo "ToD Ticket metal: $TOD_METAL"
           else
-            echo "API fetch failed, skipping update"
-            exit 0
+            echo "WARN: IGetPrices failed (HTTP $PRICES_HTTP), keeping old ToD value"
           fi
+
+          # ToD 값이 없으면 기존 값 유지
+          if [ -z "$TOD_METAL" ]; then
+            TOD_METAL=$(echo "$OLD_CONFIG" | jq -r '.todTicketMetal')
+            echo "Using existing ToD value: $TOD_METAL"
+          fi
+
+          # 4) 새 config 생성 & Gist 업데이트
+          echo ">>> Step 4: Updating Gist..."
+          NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+          NEW_CONFIG=$(jq -n \
+            --argjson krw "$OLD_KRW" \
+            --argjson mpk "$METAL_PER_KEY" \
+            --argjson tod "$TOD_METAL" \
+            --arg ts "$NOW" \
+            '{
+              keyPriceKRW: $krw,
+              metalPerKey: $mpk,
+              todTicketMetal: $tod,
+              lastUpdated: $ts
+            }')
+
+          PAYLOAD=$(jq -n --arg content "$NEW_CONFIG" '{files: {"config.json": {content: $content}}}')
+
+          PATCH_RAW=$(curl -sS -w "\nHTTP_CODE:%{http_code}" -X PATCH \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "https://api.github.com/gists/${GIST_ID}")
+          PATCH_HTTP=$(echo "$PATCH_RAW" | tail -1 | sed 's/HTTP_CODE://')
+          echo "Gist update HTTP status: $PATCH_HTTP"
+
+          if [ "$PATCH_HTTP" != "200" ]; then
+            echo "ERROR: Gist update failed (HTTP $PATCH_HTTP)"
+            echo "$PATCH_RAW" | sed '$d' | head -5
+            exit 1
+          fi
+
+          echo "✅ Updated: metalPerKey=$METAL_PER_KEY, todTicket=$TOD_METAL, time=$NOW"
